@@ -1,5 +1,5 @@
 
-# ===== Neelesh AI Video Studio v2.3 (PixVerse jaisa, personal use) =====
+# ===== Neelesh AI Video Studio v2.4 (PixVerse jaisa, personal use) =====
 # Text->Video, Photo->Video, Video Extend, Hindi prompt support
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -62,24 +62,64 @@ def use(which):
     off, on = (vace_tr, pipe.transformer) if which == "t2v" else (pipe.transformer, vace_tr)
     off.to("cpu"); gc.collect(); torch.cuda.empty_cache()
     on.to(GEN_DEV); ACTIVE = which
-# ---------- Turbo: CausVid LoRA (6 steps, bina CFG = ~5x tez) ----------
-TURBO = False
+    if 'sync_turbo' in globals(): sync_turbo()
+# ---------- Turbo: CausVid LoRA (6 steps, bina CFG = ~5x tez), khud merge karte hain ----------
+TURBO, WANT_TURBO, MERGED, LORA = False, False, {}, []
+def _map(k):
+    k = k.replace("diffusion_model.", "")
+    for a_, b_ in [("self_attn.o", "attn1.to_out.0"), ("cross_attn.o", "attn2.to_out.0"),
+                   ("self_attn.", "attn1."), ("cross_attn.", "attn2."),
+                   ("ffn.0", "ffn.net.0.proj"), ("ffn.2", "ffn.net.2"), ("norm3", "norm2"),
+                   ("head.head", "proj_out"),
+                   ("text_embedding.0", "condition_embedder.text_embedder.linear_1"),
+                   ("text_embedding.2", "condition_embedder.text_embedder.linear_2"),
+                   ("time_embedding.0", "condition_embedder.time_embedder.linear_1"),
+                   ("time_embedding.2", "condition_embedder.time_embedder.linear_2"),
+                   ("time_projection.1", "condition_embedder.time_proj")]:
+        k = k.replace(a_, b_)
+    for qq in ("q", "k", "v"):
+        k = k.replace(f"attn1.{qq}.", f"attn1.to_{qq}.").replace(f"attn2.{qq}.", f"attn2.to_{qq}.")
+    return k
 try:
     from huggingface_hub import hf_hub_download
-    _lora = hf_hub_download("Kijai/WanVideo_comfy", "Wan21_CausVid_bidirect2_T2V_1_3B_lora_rank32.safetensors")
-    pipe.load_lora_weights(_lora, adapter_name="turbo")
-    vpipe.load_lora_weights(_lora, adapter_name="turbo")
-    TURBO = True
-    print("Turbo ready")
+    from safetensors.torch import load_file
+    _sd = load_file(hf_hub_download("Kijai/WanVideo_comfy", "Wan21_CausVid_bidirect2_T2V_1_3B_lora_rank32.safetensors"))
+    for k in _sd:
+        if k.endswith(".lora_down.weight"):
+            base = k[:-len(".lora_down.weight")]
+            LORA.append((_map(base) + ".weight", "lora", _sd[base + ".lora_up.weight"].float(), _sd[k].float()))
+        elif k.endswith(".diff_b"):
+            LORA.append((_map(k[:-7]) + ".bias", "add", _sd[k].float(), None))
+        elif k.endswith(".diff"):
+            LORA.append((_map(k[:-5]) + ".weight", "add", _sd[k].float(), None))
+    _params = dict(pipe.transformer.named_parameters())
+    _miss = [n for n, *_ in LORA if n not in _params]
+    print(f"Turbo LoRA: {len(LORA)} parts, {len(_miss)} match nahi hue", _miss[:5])
+    LORA = [x for x in LORA if x[0] not in _miss]
+    TURBO = len(LORA) > 100
+    print("Turbo ready" if TURBO else "Turbo off")
 except Exception as e:
-    print("Turbo LoRA load nahi hua (normal mode chalega):", e)
+    print("Turbo LoRA load nahi hua (normal mode chalega):", repr(e))
+
+@torch.no_grad()
+def _merge(model, sign):
+    params = dict(model.named_parameters())
+    for name, kind, up, down in LORA:
+        w = params.get(name)
+        if w is None:
+            continue
+        d = (up.to(w.device) @ down.to(w.device)) if kind == "lora" else up.to(w.device)
+        w.add_((sign * d).to(w.dtype))
+
+def sync_turbo():
+    m = pipe.transformer if ACTIVE == "t2v" else vace_tr
+    on = bool(MERGED.get(id(m)))
+    if TURBO and WANT_TURBO != on:
+        _merge(m, 1.0 if WANT_TURBO else -1.0); MERGED[id(m)] = WANT_TURBO
 
 def set_turbo(on):
-    for pp in (pipe, vpipe):
-        try:
-            pp.enable_lora() if on else pp.disable_lora()
-        except Exception as e:
-            print("lora toggle:", e)
+    global WANT_TURBO
+    WANT_TURBO = on; sync_turbo()
 print("Photo->Video + Extend ready")
 
 # ---------- Hindi -> English ----------
